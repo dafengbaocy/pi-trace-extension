@@ -1009,12 +1009,17 @@ def load_events(session: Path) -> list:
     return events
 
 
-def render_session_html(session: Path) -> str:
-    """把单个 session 渲染成完整 HTML 字符串（CLI 与 serve.py 复用）。"""
-    events = load_events(session)
-    root = build_tree(events, session_dir=str(session))
-    scrub_tree(root)
-    dag = collect_dag_stats(root)
+def render_session_html(session: Path, root=None, dag=None) -> str:
+    """把单个 session 渲染成完整 HTML 字符串（CLI 与 serve.py 复用）。
+
+    root/dag 可由 serve.py 传入已解析（且可能被轻量化）的树，避免重复解析。
+    """
+    if root is None:
+        events = load_events(session)
+        root = build_tree(events, session_dir=str(session))
+        scrub_tree(root)
+    if dag is None:
+        dag = collect_dag_stats(root)
 
     interaction_count = len(root.get("children", []))
     total_cost = root["data"]["totalUsage"].get("cost", 0)

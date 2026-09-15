@@ -84,11 +84,46 @@ function renderNodeRow(n, depth) {
   return wrap;
 }
 
+const LAZY_CACHE = {};
+
+function showDetailLoading(node) {
+  const pane = document.getElementById("detail-pane");
+  if (!pane) return;
+  pane.replaceChildren();
+  pane.appendChild(el("div", "detail-empty", "加载 " + ((node && (node.name || node.type)) || "节点") + " 详情…"));
+}
+
 function selectNode(id) {
   document.querySelectorAll(".node-row.active").forEach(r => r.classList.remove("active"));
   const row = document.querySelector('.node-row[data-node-id="' + CSS.escape(id) + '"]');
   if (row) { row.classList.add("active"); row.scrollIntoView({block: "nearest"}); }
-  renderDetail(NODE_INDEX[id]);
+  const node = NODE_INDEX[id];
+  if (!node) return;
+  // 轻量化页面：大 payload 不在内嵌数据里，点开时按需拉取（带前端缓存）。
+  if (node.__lazy && !node.__lazyLoaded) {
+    if (LAZY_CACHE[id]) {
+      node.data = LAZY_CACHE[id];
+      node.__lazyLoaded = true;
+      renderDetail(node);
+      return;
+    }
+    if (window.__piTraceNodeUrl) {
+      showDetailLoading(node);
+      fetch(window.__piTraceNodeUrl + encodeURIComponent(id), { headers: { accept: "application/json" }, cache: "no-store" })
+        .then((res) => res.ok ? res.json() : Promise.reject(new Error("HTTP " + res.status)))
+        .then((payload) => {
+          if (!payload || !payload.node) throw new Error("bad payload");
+          const current = NODE_INDEX[id] || node;
+          current.data = payload.node.data;
+          current.__lazyLoaded = true;
+          LAZY_CACHE[id] = current.data;
+          renderDetail(current);
+        })
+        .catch(() => renderDetail(node));
+      return;
+    }
+  }
+  renderDetail(node);
 }
 
 function rebuildNodeIndex() {
