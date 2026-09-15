@@ -38,7 +38,13 @@ if str(HERE) not in sys.path:
 import trace_to_html  # noqa: E402  same-dir import; loads viewer/assets.json at import
 
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
-DEFAULT_TRACES = Path.home() / ".pi" / "agent" / "traces"
+def default_traces() -> Path:
+    agent_dir = (os.environ.get("PI_CODING_AGENT_DIR") or "").strip()
+    base = Path(agent_dir).expanduser() if agent_dir else Path.home() / ".pi" / "agent"
+    return base / "traces"
+
+
+DEFAULT_TRACES = default_traces()
 LEASE_TTL_MS = 30_000
 MAX_BODY_BYTES = 64 * 1024
 

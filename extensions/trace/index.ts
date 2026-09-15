@@ -26,7 +26,15 @@ import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const TRACE_DIR = path.join(os.homedir(), ".pi", "agent", "traces");
+// 遵循 pi 的 agent 目录约定：PI_CODING_AGENT_DIR（支持 ~）优先，否则 ~/.pi/agent
+function expandTilde(value: string): string {
+	if (value === "~") return os.homedir();
+	if (value.startsWith("~/") || value.startsWith("~\\")) return path.join(os.homedir(), value.slice(2));
+	return value;
+}
+const ENV_AGENT_DIR = (process.env.PI_CODING_AGENT_DIR ?? "").trim();
+const AGENT_DIR = ENV_AGENT_DIR ? expandTilde(ENV_AGENT_DIR) : path.join(os.homedir(), ".pi", "agent");
+const TRACE_DIR = path.join(AGENT_DIR, "traces");
 // 当前文件所在目录（扩展自己的目录），用于定位 trace_to_html.py
 const EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PYTHON_SCRIPT = path.join(EXTENSION_DIR, "trace_to_html.py");

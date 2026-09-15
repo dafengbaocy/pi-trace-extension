@@ -57,6 +57,8 @@ Use pi normally — events are streamed to disk in the background.
 ~/.pi/agent/traces/<session-id>/events.jsonl
 ```
 
+The trace root follows pi's agent directory: `PI_CODING_AGENT_DIR` when set, otherwise `~/.pi/agent`.
+
 Render the HTML report at any time:
 
 ```
