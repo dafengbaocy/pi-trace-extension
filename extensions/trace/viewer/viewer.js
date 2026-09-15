@@ -1,5 +1,5 @@
-const TRACE_DATA = /*__DATA__*/null;
-const DAG_STATS = /*__DAG__*/null;
+let TRACE_DATA = /*__DATA__*/null;
+let DAG_STATS = /*__DAG__*/null;
 
 function fmtMs(ms) { if (ms == null) return ""; if (ms < 1000) return ms + "ms"; const s = ms/1000; if (s < 60) return s.toFixed(2)+"s"; const m = Math.floor(s/60); return m+"m "+Math.round(s-m*60)+"s"; }
 function fmtMoney(x) {
@@ -89,6 +89,52 @@ function selectNode(id) {
   const row = document.querySelector('.node-row[data-node-id="' + CSS.escape(id) + '"]');
   if (row) { row.classList.add("active"); row.scrollIntoView({block: "nearest"}); }
   renderDetail(NODE_INDEX[id]);
+}
+
+function rebuildNodeIndex() {
+  for (const key of Object.keys(NODE_INDEX)) delete NODE_INDEX[key];
+  (function index(n) { NODE_INDEX[n.id] = n; (n.children || []).forEach(index); })(TRACE_DATA);
+}
+
+// 供本地 server 的 SSE 增量刷新调用。静态 trace.html 不调用，行为不变。
+// 保留折叠状态、选中节点与滚动位置，避免整页 reload。
+window.__piTraceApply = function (data, dag) {
+  if (!data) return;
+  const treeEl = document.getElementById("tree-list");
+  if (!treeEl) return;
+  const collapsed = new Set(
+    Array.from(treeEl.querySelectorAll(".node-row.collapsed")).map((row) => row.dataset.nodeId)
+  );
+  const selected = treeEl.querySelector(".node-row.active")?.dataset.nodeId;
+  const scrollTop = treeEl.scrollTop;
+  const previousSignature = selected && NODE_INDEX[selected] ? nodeSignature(NODE_INDEX[selected]) : "";
+  TRACE_DATA = data;
+  if (dag) DAG_STATS = dag;
+  rebuildNodeIndex();
+  treeEl.replaceChildren(renderNodeRow(TRACE_DATA, 0));
+  for (const id of collapsed) {
+    const row = treeEl.querySelector('.node-row[data-node-id="' + CSS.escape(id) + '"]');
+    if (!row) continue;
+    row.classList.add("collapsed");
+    const childWrap = row.nextElementSibling;
+    if (childWrap && childWrap.classList.contains("node-children")) childWrap.classList.add("hidden");
+  }
+  renderDag();
+  renderToolFailures();
+  if (selected && NODE_INDEX[selected]) {
+    const row = treeEl.querySelector('.node-row[data-node-id="' + CSS.escape(selected) + '"]');
+    if (row) row.classList.add("active");
+    // 只在选中节点确实变化时重绘详情，避免大 payload 每 1.2s 重渲染导致卡顿。
+    if (nodeSignature(NODE_INDEX[selected]) !== previousSignature) renderDetail(NODE_INDEX[selected]);
+  } else {
+    const firstInteraction = TRACE_DATA.children && TRACE_DATA.children[0];
+    if (firstInteraction) selectNode(firstInteraction.id);
+  }
+  treeEl.scrollTop = scrollTop;
+};
+
+function nodeSignature(n) {
+  return n ? [n.status, n.end, n.duration_ms, (n.children || []).length].join("|") : "";
 }
 
 function applySearch(q) {

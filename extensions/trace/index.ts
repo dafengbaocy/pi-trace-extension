@@ -31,6 +31,13 @@ const TRACE_DIR = path.join(os.homedir(), ".pi", "agent", "traces");
 const EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PYTHON_SCRIPT = path.join(EXTENSION_DIR, "trace_to_html.py");
 const PYTHON_BIN = process.env.PI_TRACE_PYTHON || "python3";
+// serve.py：本地实时服务（方案 A：租约 + drain 自动退出）
+const SERVE_SCRIPT = path.join(EXTENSION_DIR, "serve.py");
+const SERVE_PORT = (() => {
+	const parsed = Number.parseInt(process.env.PI_TRACE_WEB_PORT || "4317", 10);
+	return Number.isSafeInteger(parsed) && parsed >= 1 && parsed <= 65_535 ? parsed : 4317;
+})();
+const SERVE_URL = `http://127.0.0.1:${SERVE_PORT}`;
 
 // 读文件的第一行而不读整个文件（child events.jsonl 可能很大；只看 session_start.ts）
 function readFirstLine(file: string, maxBytes = 8192): string {
@@ -118,6 +125,67 @@ export default function (pi: ExtensionAPI) {
 	let turnStartStep = 0;
 	let stepStartTime = 0;
 	let providerRequestStart = 0;
+
+	// ─── serve.py 生命周期（方案 A）───────────────────────────────────────
+	// 每个 pi 进程注册一个 lease 并每 10s 续租；serve.py 在最后一个 lease
+	// 消失 30s 后自动退出。任何失败都 fail-open，不影响 pi 主进程。
+	let serveHeartbeat: ReturnType<typeof setInterval> | null = null;
+	let serveRunId = "";
+
+	const serveHealthy = async (timeoutMs = 1000): Promise<boolean> => {
+		try {
+			const response = await fetch(`${SERVE_URL}/api/health`, { signal: AbortSignal.timeout(timeoutMs) });
+			return response.ok;
+		} catch {
+			return false;
+		}
+	};
+
+	const leaseRequest = async (method: "POST" | "DELETE"): Promise<void> => {
+		try {
+			await fetch(`${SERVE_URL}/api/lease`, {
+				method,
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ runId: serveRunId, pid: process.pid, sessionId, dir: sessionDir }),
+				signal: AbortSignal.timeout(1500),
+			});
+		} catch {
+			// fail-open
+		}
+	};
+
+	const startServe = async (): Promise<void> => {
+		if (serveHeartbeat || !fs.existsSync(SERVE_SCRIPT)) return;
+		serveRunId = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+		if (!(await serveHealthy())) {
+			try {
+				const child = spawn(PYTHON_BIN, [SERVE_SCRIPT, "--traces", TRACE_DIR, "--port", String(SERVE_PORT)], {
+					stdio: "ignore",
+					detached: true,
+				});
+				child.unref();
+			} catch {
+				// fail-open
+			}
+			for (let attempt = 0; attempt < 40; attempt += 1) {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				if (await serveHealthy()) break;
+			}
+		}
+		await leaseRequest("POST");
+		serveHeartbeat = setInterval(() => { void leaseRequest("POST"); }, 10_000);
+		serveHeartbeat.unref?.();
+	};
+
+	const stopServe = async (): Promise<void> => {
+		if (serveHeartbeat) {
+			clearInterval(serveHeartbeat);
+			serveHeartbeat = null;
+		}
+		if (!serveRunId) return;
+		await leaseRequest("DELETE");
+		serveRunId = "";
+	};
 
 	// message_update 流式事件里可能有明文 thinking，但最终 message_end 可能只剩签名。
 	// 按 step 缓存一次，message_end 时回填到 step_end。
@@ -453,6 +521,9 @@ export default function (pi: ExtensionAPI) {
 			isSubagent: isSubagent || undefined,
 			parentDir: isSubagent ? process.env.PI_TRACE_PARENT_DIR : undefined,
 		}));
+
+		// 方案 A：确保 serve.py 在跑，并开始续租
+		void startServe().catch(() => { /* fail-open */ });
 	}));
 
 	// ========================================================================
@@ -520,7 +591,7 @@ export default function (pi: ExtensionAPI) {
 	//   /trace       → 当前 session 的 trace.html
 	//   /trace all   → 跨会话 dashboard（~/.pi/agent/traces/index.html）
 	pi.registerCommand("trace", {
-		description: "Render trace.html for this session, or /trace all for the cross-session dashboard",
+		description: "Render trace.html (/trace), the dashboard (/trace all), or open the live server (/trace serve)",
 		handler: async (args, ctx) => {
 			const sub = (args || "").trim().toLowerCase();
 			if (sub === "") {
@@ -531,13 +602,23 @@ export default function (pi: ExtensionAPI) {
 				const r = renderDashboard({ open: true, sync: true });
 				if (r.ok) ctx.ui.notify(`✓ dashboard → ${r.output}`, "info");
 				else ctx.ui.notify(`✗ dashboard render failed: ${r.error}`, "error");
+			} else if (sub === "serve") {
+				await startServe();
+				const url = sessionId ? `${SERVE_URL}/session/${encodeURIComponent(sessionId)}` : SERVE_URL;
+				if (await serveHealthy(2000)) {
+					openInBrowser(url);
+					ctx.ui.notify(`✓ live trace → ${url}`, "info");
+				} else {
+					ctx.ui.notify(`✗ Pi Trace live server 未就绪（检查 Python / 端口 ${SERVE_PORT}）`, "error");
+				}
 			} else {
-				ctx.ui.notify("Usage: /trace [all]", "info");
+				ctx.ui.notify("Usage: /trace [all|serve]", "info");
 			}
 		},
 	});
 
 	pi.on("session_shutdown", safeHandler("session_shutdown", () => {
+		void stopServe().catch(() => { /* fail-open */ });
 		writeEvent(baseEvent({ type: "session_shutdown" }));
 		// H1 修复：立即置 null 屏蔽后续写入，避免 renderHtml(sync) 阻塞期间被
 		// 其他 handler（如未收尾的 tool_end）写到已 end() 的 stream 上触发

@@ -119,6 +119,8 @@ function renderRow(s) {
   const idTd = el("td", "col-id");
   const a = el("a", null, shortId(s.id));
   a.href = "./" + s.id + "/trace.html";
+  a.target = "_blank";
+  a.rel = "noopener";
   a.title = s.id;
   idTd.appendChild(a);
   tr.appendChild(idTd);

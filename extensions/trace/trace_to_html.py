@@ -996,34 +996,22 @@ def dashboard_main():
     print(f"  open {out}")
 
 
-def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "--dashboard":
-        dashboard_main()
-        return
-    if len(sys.argv) > 1:
-        target = sys.argv[1]
-        if target in ("-h", "--help"):
-            print(__doc__)
-            sys.exit(0)
-        cand = Path(target)
-        if not cand.exists(): cand = TRACES / target
-        session = cand
-    else:
-        session = latest_session()
-        if not session:
-            print("No session found"); sys.exit(1)
-    events_file = session / "events.jsonl"
-    if not events_file.exists():
-        print(f"events.jsonl not found in {session}"); sys.exit(1)
-
+def load_events(session: Path) -> list:
+    """读取 session 下的 events.jsonl，跳过坏行。"""
     events = []
+    events_file = session / "events.jsonl"
     with open(events_file, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line: continue
             try: events.append(json.loads(line))
-            except: pass
+            except Exception: pass
+    return events
 
+
+def render_session_html(session: Path) -> str:
+    """把单个 session 渲染成完整 HTML 字符串（CLI 与 serve.py 复用）。"""
+    events = load_events(session)
     root = build_tree(events, session_dir=str(session))
     scrub_tree(root)
     dag = collect_dag_stats(root)
@@ -1054,18 +1042,38 @@ def main():
     data_json = _safe(data_json)
     dag_json = _safe(dag_json)
 
-    css = ASSETS_CSS
     js = ASSETS_JS.replace("/*__DATA__*/null", data_json, 1).replace("/*__DAG__*/null", dag_json, 1)
 
-    out_html = HTML_TPL.format(
+    return HTML_TPL.format(
         session_name=html.escape(session.name),
-        css=css, js=js,
+        css=ASSETS_CSS, js=js,
         interaction_count=interaction_count,
         step_count=step_count, tool_count=tool_count,
         total_cost=fmt_money(total_cost), total_dur=fmt_ms(total_dur),
     )
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--dashboard":
+        dashboard_main()
+        return
+    if len(sys.argv) > 1:
+        target = sys.argv[1]
+        if target in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        cand = Path(target)
+        if not cand.exists(): cand = TRACES / target
+        session = cand
+    else:
+        session = latest_session()
+        if not session:
+            print("No session found"); sys.exit(1)
+    if not (session / "events.jsonl").exists():
+        print(f"events.jsonl not found in {session}"); sys.exit(1)
+
     output = session / "trace.html"
-    output.write_text(out_html, encoding="utf-8")
+    output.write_text(render_session_html(session), encoding="utf-8")
     print(f"✓ Wrote {output}")
     print(f"  open {output}")
 

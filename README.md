@@ -97,6 +97,24 @@ python3 ~/.pi/agent/npm/pi-trace-extension/extensions/trace/trace_to_html.py --d
 
 The dashboard shows: week + all-time KPI cards (sessions / cost / duration); a sortable, searchable table (time, session id, first prompt, project, scale, tokens, cost, duration) with a left-side color bar per row (green = ok, yellow = aborted, red = has errors); and project-name chips for quick filtering. Click a session id → jump to that session's `trace.html`.
 
+**Live server** — `serve.py` tails the trace directory and serves the same viewer/dashboard over loopback HTTP, so no static file is needed.
+
+Inside a pi session:
+
+```
+/trace serve
+```
+
+Opens `http://127.0.0.1:4317/session/<id>` (or the session list when there is no active session). The page shows a "有新事件 · 点击刷新" badge when new events land.
+
+Lifecycle:
+
+- Starting a pi session starts or joins the single local server on `127.0.0.1:4317`.
+- Every pi process renews a lease every 10s; `session_shutdown` removes it.
+- After the last lease is gone for 30s, the server closes the port and exits. Historical traces stay on disk and are browsable the next time a server starts.
+- `PI_TRACE_WEB_PORT` changes the port (default `4317`); `PI_TRACE_WEB_IDLE_MS` changes the drain time (default `30000`, min `5000`).
+- Manual browsing without pi: `python3 extensions/trace/serve.py --no-idle-exit`.
+
 * * *
 
 ## The pipeline
