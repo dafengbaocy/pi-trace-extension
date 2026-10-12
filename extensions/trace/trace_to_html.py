@@ -75,7 +75,7 @@ def _find_child_traces_for_tool(session_dir, tool_start_ts, tool_end_ts):
     return [m[1] for m in matches]
 
 
-def _load_child_trace_steps(child_trace_dir):
+def _load_child_trace_steps(child_trace_dir, live=False):
     """子 trace events.jsonl → 按出现顺序的 step 信息列表。
 
     每条 step 对应子 agent 内一次 LLM 调用，包含：
@@ -87,8 +87,18 @@ def _load_child_trace_steps(child_trace_dir):
         return []
     steps_by_si = {}   # stepIndex → partial info
     step_order = []    # step_start 出现的 stepIndex 序列（currentStep 单调递增，无重复）
-    with open(f, encoding="utf-8") as fh:
-        for line in fh:
+    if live:
+        from live_index import EventIndex
+        index = EventIndex(child_trace_dir)
+        try:
+            events = index.events()
+        finally:
+            index.close()
+        lines = (json.dumps(event) for event in events)
+    else:
+        lines = open(f, encoding="utf-8")
+    try:
+        for line in lines:
             line = line.strip()
             if not line:
                 continue
@@ -119,6 +129,9 @@ def _load_child_trace_steps(child_trace_dir):
                     "errorMessage": e.get("errorMessage"),
                     "model": e.get("model"),
                 })
+    finally:
+        if not live:
+            lines.close()
     return [steps_by_si[si] for si in step_order if si in steps_by_si]
 
 
@@ -369,7 +382,7 @@ def _attach_point_event(node, cur_interaction, cur_turn_key, turns, session_orph
         session_orphans.append(node)
 
 
-def build_tree(events, session_dir=None):
+def build_tree(events, session_dir=None, live=False):
     interactions = []
     turns = {}     # 复合 key: (epoch, iid, turn_seq) -> turn node。turn_seq 是该 interaction 内 turn 的出现序号
     steps = {}     # 复合 key: (epoch, iid, stepIndex) -> step node
@@ -638,7 +651,12 @@ def build_tree(events, session_dir=None):
                                     )
                                     child_dir = child_dirs[idx] if idx < len(child_dirs) else None
                                 if child_dir:
-                                    child_steps = _load_child_trace_steps(child_dir)
+                                    child_steps = _load_child_trace_steps(child_dir, live=live)
+                                    if live:
+                                        for child_step in child_steps:
+                                            reference = (child_step.get("input") or {}).get("__traceInput")
+                                            if reference:
+                                                reference["session"] = str(Path(child_dir).relative_to(Path(session_dir)))
                                     # 回填 childTraceId 供 UI 跳转按钮使用（兜底路径才会改写）
                                     sn["data"]["childTraceId"] = Path(child_dir).name
                             sn["children"] = _build_subagent_subtree(sub_messages, sn["id"], child_steps)

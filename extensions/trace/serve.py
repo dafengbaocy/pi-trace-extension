@@ -35,9 +35,15 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-import trace_to_html  # noqa: E402  same-dir import; loads viewer/assets.json at import
+import trace_to_html  # noqa: E402
+from live_index import EventIndex, event_summary
 
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
+def valid_session_path(value):
+    parts = value.split("/")
+    return bool(parts) and all(SESSION_ID_RE.fullmatch(p) and p not in (".", "..") for p in parts)
+
+
 def default_traces() -> Path:
     agent_dir = (os.environ.get("PI_CODING_AGENT_DIR") or "").strip()
     base = Path(agent_dir).expanduser() if agent_dir else Path.home() / ".pi" / "agent"
@@ -136,7 +142,7 @@ def summaries(traces: Path) -> list[dict]:
     out = []
     for session_id in list_session_ids(traces):
         try:
-            summary = trace_to_html.extract_summary(traces / session_id)
+            summary = LIVE_CACHE.summary(traces / session_id)
         except Exception:
             summary = None
         if summary:
@@ -157,16 +163,16 @@ def index_nodes(root: dict) -> dict:
     return nodes
 
 
-# 轻量化：把 step.data.input（发给 LLM 的完整请求体，占绝大部分体积）换成
-# __lazy 标记，点详情时再通过 /api/session/<id>/node 取完整节点。不修改原树。
+# Keep timeline labels, metrics and error previews; load node detail on selection.
+# Historical request Input is read separately by its file offset.
 def light_tree(root: dict) -> dict:
     def walk(node: dict) -> dict:
         clone = dict(node)
         data = node.get("data")
-        if isinstance(data, dict) and "input" in data:
-            reduced = {key: value for key, value in data.items() if key != "input"}
-            reduced["input"] = {"__lazy": True}
-            clone["data"] = reduced
+        if isinstance(data, dict):
+            clone["data"] = {key: data[key] for key in ("toolName", "usage", "totalUsage", "model", "stepIndex", "turnIndex", "stopReason", "prompt", "resultPreview") if key in data}
+            if node.get("status") != "error":
+                clone["data"].pop("resultPreview", None)
             clone["__lazy"] = True
         clone["children"] = [walk(child) for child in (node.get("children") or [])]
         return clone
@@ -175,31 +181,56 @@ def light_tree(root: dict) -> dict:
 
 
 class TreeCache:
-    """按 events.jsonl 的 size+mtime 缓存解析结果，同时持有完整树与轻量树。"""
+    """Single-flight lightweight trees backed by append-only persistent indexes."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._entries: dict[str, dict] = {}
+        self._entries = {}
+        self._indexes = {}
+        self._locks = {}
+        self._summaries = {}
 
-    def get(self, session_id: str, session: Path):
-        try:
-            stat = (session / "events.jsonl").stat()
-            key = (stat.st_size, stat.st_mtime_ns)
-        except OSError:
-            key = None
+    def state(self, session):
+        key = str(session)
         with self._lock:
-            entry = self._entries.get(session_id)
-        if entry and entry["key"] == key:
-            return entry["root"], entry["nodes"], entry["light"], entry["dag"]
-        events = trace_to_html.load_events(session)
-        root = trace_to_html.build_tree(events, session_dir=str(session))
-        trace_to_html.scrub_tree(root)
-        dag = trace_to_html.collect_dag_stats(root)
-        nodes = index_nodes(root)
-        light = light_tree(root)
-        with self._lock:
-            self._entries[session_id] = {"key": key, "root": root, "nodes": nodes, "light": light, "dag": dag}
-        return root, nodes, light, dag
+            if key not in self._indexes:
+                self._indexes[key] = EventIndex(session)
+                self._locks[key] = threading.Lock()
+            return self._indexes[key], self._locks[key]
+
+    def summary(self, session):
+        index, lock = self.state(session)
+        with lock:
+            key = signature(session / "events.jsonl")
+            previous = self._summaries.get(str(session))
+            if previous and previous[0] == key:
+                return previous[1]
+            events = index.events()
+            summary = event_summary(session, events)
+            self._summaries[str(session)] = (key, summary)
+            return summary
+
+    def get(self, session_id, session):
+        index, lock = self.state(session)
+        with lock:
+            key = signature(session / "events.jsonl")
+            entry = self._entries.get(str(session))
+            if entry and entry["key"] == key:
+                return entry["root"], entry["nodes"], entry["light"], entry["dag"]
+            events = index.events()
+            root = trace_to_html.build_tree(events, session_dir=str(session), live=True)
+            trace_to_html.scrub_tree(root)
+            dag = trace_to_html.collect_dag_stats(root)
+            nodes = index_nodes(root)
+            light = light_tree(root)
+            self._entries.pop(str(session), None)
+            self._entries[str(session)] = dict(key=key, root=root, nodes=nodes, light=light, dag=dag)
+            if len(self._entries) > 2:
+                self._entries.pop(next(iter(self._entries)))
+            return root, nodes, light, dag
+
+
+LIVE_CACHE = TreeCache()
 
 
 def health_ok(port: int, timeout: float = 0.5) -> bool:
@@ -289,7 +320,7 @@ class Hub:
             channels = list(self._subs)
         for channel in channels:
             try:
-                channel.put_nowait("changed")
+                channel.put_nowait(key)
             except queue.Full:
                 pass
 
@@ -365,18 +396,18 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/stream":
             self._stream(None)
         else:
-            match = re.fullmatch(r"/api/session/([^/]+)/tree", path)
+            match = re.fullmatch(r"/api/session/(.+)/tree", path)
             if match:
                 self._tree(match.group(1))
                 return
-            match = re.fullmatch(r"/api/session/([^/]+)/stream", path)
+            match = re.fullmatch(r"/api/session/(.+)/stream", path)
             if match:
                 self._stream(match.group(1))
                 return
-            match = re.fullmatch(r"/api/session/([^/]+)/node", path)
+            match = re.fullmatch(r"/api/session/(.+)/node", path)
             if match:
                 node_id = parse_qs(urlparse(self.path).query).get("nodeId", [""])[0]
-                self._node(match.group(1), node_id)
+                self._node(match.group(1), node_id, parse_qs(urlparse(self.path).query).get("field", [""])[0])
                 return
             self._viewer_route(path)
 
@@ -425,8 +456,9 @@ class Handler(BaseHTTPRequestHandler):
                 html = trace_to_html.render_session_html(session, root=light, dag=dag)
                 live = session_live_script(segments[0])
             else:
-                html = trace_to_html.render_session_html(session)
-                live = ""
+                _, _, light, dag = self.server.tree_cache.get("/".join(segments), session)
+                html = trace_to_html.render_session_html(session, root=light, dag=dag)
+                live = session_live_script("/".join(segments))
         except Exception as exc:
             self._json({"error": f"render failed: {exc}"}, 500)
             return
@@ -479,7 +511,7 @@ class Handler(BaseHTTPRequestHandler):
         self._html(inject_before_body(html, dashboard_live_script()))
 
     def _tree(self, session_id: str) -> None:
-        if not SESSION_ID_RE.match(session_id):
+        if not valid_session_path(session_id):
             self._json({"error": "invalid session id"}, 400)
             return
         session = self.server.traces / session_id  # type: ignore[attr-defined]
@@ -489,8 +521,8 @@ class Handler(BaseHTTPRequestHandler):
         _, _, light, dag = self.server.tree_cache.get(session_id, session)  # type: ignore[attr-defined]
         self._json({"tree": light, "dag": dag})
 
-    def _node(self, session_id: str, node_id: str) -> None:
-        if not SESSION_ID_RE.match(session_id) or not node_id:
+    def _node(self, session_id: str, node_id: str, field: str = "") -> None:
+        if not valid_session_path(session_id) or not node_id:
             self._json({"error": "invalid request"}, 400)
             return
         session = self.server.traces / session_id  # type: ignore[attr-defined]
@@ -502,10 +534,19 @@ class Handler(BaseHTTPRequestHandler):
         if not node:
             self._json({"error": "node not found"}, 404)
             return
-        self._json({"node": node})
+        if field == "input":
+            reference = (node.get("data", {}).get("input") or {}).get("__traceInput")
+            if reference:
+                input_session = session / reference.get("session", ".")
+                index, _ = self.server.tree_cache.state(input_session)
+                self._json({"input": trace_to_html.sanitize(index.input(reference))})
+            else:
+                self._json({"input": node.get("data", {}).get("input")})
+        else:
+            self._json({"node": {key: value for key, value in node.items() if key != "children"}})
 
     def _stream(self, session_id: str | None) -> None:
-        if session_id is not None and not SESSION_ID_RE.match(session_id):
+        if session_id is not None and not valid_session_path(session_id):
             self._json({"error": "invalid session id"}, 400)
             return
         self._headers("text/event-stream; charset=utf-8")
@@ -524,6 +565,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(b"event: server_closing\ndata: {}\n\n")
                     self.wfile.flush()
                     return
+                if session_id is not None and event not in (session_id, "__global__"):
+                    continue
                 self.wfile.write(b"event: changed\ndata: {}\n\n")
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -562,7 +605,7 @@ def main(argv: list[str] | None = None) -> int:
     server.hub = Hub()  # type: ignore[attr-defined]
     server.leases = LeaseStore()  # type: ignore[attr-defined]
     server.stop = stop  # type: ignore[attr-defined]
-    server.tree_cache = TreeCache()  # type: ignore[attr-defined]
+    server.tree_cache = LIVE_CACHE  # type: ignore[attr-defined]
 
     def lease_loop() -> None:
         while not stop.is_set():

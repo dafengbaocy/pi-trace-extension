@@ -72,10 +72,17 @@ function renderNodeRow(n, depth) {
 
   if (hasChildren) {
     const cwrap = el("div", "node-children");
-    n.children.forEach(c => cwrap.appendChild(renderNodeRow(c, depth + 1)));
+    cwrap.__mount = () => {
+      if (cwrap.dataset.mounted) return;
+      cwrap.dataset.mounted = "1";
+      n.children.forEach(c => cwrap.appendChild(renderNodeRow(c, depth + 1)));
+    };
+    if (depth < 2) cwrap.__mount();
+    else { cwrap.classList.add("hidden"); row.classList.add("collapsed"); }
     wrap.appendChild(cwrap);
     tog.addEventListener("click", (e) => {
       e.stopPropagation();
+      cwrap.__mount();
       row.classList.toggle("collapsed");
       cwrap.classList.toggle("hidden");
     });
@@ -84,7 +91,8 @@ function renderNodeRow(n, depth) {
   return wrap;
 }
 
-const LAZY_CACHE = {};
+const LAZY_CACHE = new Map();
+let selectedNodeId = null;
 
 function showDetailLoading(node) {
   const pane = document.getElementById("detail-pane");
@@ -94,6 +102,8 @@ function showDetailLoading(node) {
 }
 
 function selectNode(id) {
+  selectedNodeId = id;
+  mountNodePath(id);
   document.querySelectorAll(".node-row.active").forEach(r => r.classList.remove("active"));
   const row = document.querySelector('.node-row[data-node-id="' + CSS.escape(id) + '"]');
   if (row) { row.classList.add("active"); row.scrollIntoView({block: "nearest"}); }
@@ -101,29 +111,54 @@ function selectNode(id) {
   if (!node) return;
   // 轻量化页面：大 payload 不在内嵌数据里，点开时按需拉取（带前端缓存）。
   if (node.__lazy && !node.__lazyLoaded) {
-    if (LAZY_CACHE[id]) {
-      node.data = LAZY_CACHE[id];
+    const cached = LAZY_CACHE.get(id);
+    if (cached && cached.signature === nodeSignature(node)) {
+      node.data = cached.data;
       node.__lazyLoaded = true;
       renderDetail(node);
       return;
     }
     if (window.__piTraceNodeUrl) {
       showDetailLoading(node);
+      const requestedSignature = nodeSignature(node);
       fetch(window.__piTraceNodeUrl + encodeURIComponent(id), { headers: { accept: "application/json" }, cache: "no-store" })
         .then((res) => res.ok ? res.json() : Promise.reject(new Error("HTTP " + res.status)))
         .then((payload) => {
           if (!payload || !payload.node) throw new Error("bad payload");
           const current = NODE_INDEX[id] || node;
+          if (nodeSignature(current) !== requestedSignature) { if (selectedNodeId === id) selectNode(id); return; }
           current.data = payload.node.data;
           current.__lazyLoaded = true;
-          LAZY_CACHE[id] = current.data;
-          renderDetail(current);
+          LAZY_CACHE.set(id, {signature: nodeSignature(current), data: current.data});
+          if (LAZY_CACHE.size > 16) LAZY_CACHE.delete(LAZY_CACHE.keys().next().value);
+          if (selectedNodeId === id) renderDetail(current);
         })
-        .catch(() => renderDetail(node));
+        .catch(() => { if (selectedNodeId === id) renderDetail(node); });
       return;
     }
   }
   renderDetail(node);
+}
+
+function mountNodePath(id) {
+  const path = [];
+  for (let n = NODE_INDEX[id]; n; n = NODE_INDEX[n.parent_id]) path.unshift(n.id);
+  for (const key of path) {
+    const row = document.querySelector('.node-row[data-node-id="' + CSS.escape(key) + '"]');
+    const children = row && row.nextElementSibling;
+    if (children && children.__mount) {
+      children.__mount();
+      if (key !== id) { children.classList.remove("hidden"); row.classList.remove("collapsed"); }
+    }
+  }
+}
+
+function mountAllRows() {
+  let pending;
+  do {
+    pending = Array.from(document.querySelectorAll(".node-children")).filter(c => !c.dataset.mounted);
+    pending.forEach(c => c.__mount && c.__mount());
+  } while (pending.length);
 }
 
 function rebuildNodeIndex() {
@@ -140,6 +175,7 @@ window.__piTraceApply = function (data, dag) {
   const collapsed = new Set(
     Array.from(treeEl.querySelectorAll(".node-row.collapsed")).map((row) => row.dataset.nodeId)
   );
+  const expanded = Array.from(treeEl.querySelectorAll(".node-row:not(.collapsed):not(.leaf)")).map(row => row.dataset.nodeId);
   const selected = treeEl.querySelector(".node-row.active")?.dataset.nodeId;
   const scrollTop = treeEl.scrollTop;
   const previousSignature = selected && NODE_INDEX[selected] ? nodeSignature(NODE_INDEX[selected]) : "";
@@ -147,6 +183,12 @@ window.__piTraceApply = function (data, dag) {
   if (dag) DAG_STATS = dag;
   rebuildNodeIndex();
   treeEl.replaceChildren(renderNodeRow(TRACE_DATA, 0));
+  for (const id of expanded) {
+    mountNodePath(id);
+    const row = treeEl.querySelector('.node-row[data-node-id="' + CSS.escape(id) + '"]');
+    if (row) { row.classList.remove("collapsed"); row.nextElementSibling?.classList.remove("hidden"); }
+  }
+  if (selected) mountNodePath(selected);
   for (const id of collapsed) {
     const row = treeEl.querySelector('.node-row[data-node-id="' + CSS.escape(id) + '"]');
     if (!row) continue;
@@ -160,7 +202,7 @@ window.__piTraceApply = function (data, dag) {
     const row = treeEl.querySelector('.node-row[data-node-id="' + CSS.escape(selected) + '"]');
     if (row) row.classList.add("active");
     // 只在选中节点确实变化时重绘详情，避免大 payload 每 1.2s 重渲染导致卡顿。
-    if (nodeSignature(NODE_INDEX[selected]) !== previousSignature) renderDetail(NODE_INDEX[selected]);
+    if (nodeSignature(NODE_INDEX[selected]) !== previousSignature) selectNode(selected);
   } else {
     const firstInteraction = TRACE_DATA.children && TRACE_DATA.children[0];
     if (firstInteraction) selectNode(firstInteraction.id);
@@ -206,6 +248,7 @@ function applyFilters() {
     document.querySelectorAll(".node-row").forEach(row => { row.style.display = ""; });
     return;
   }
+  mountAllRows();
   markKeep(TRACE_DATA, q, onlyErr);
   document.querySelectorAll(".node-row").forEach(row => {
     const n = NODE_INDEX[row.dataset.nodeId];
@@ -263,7 +306,7 @@ function renderJsonValue(value, container, indent, key) {
     if (value.length > 120 || value.includes("\n")) {
       const {row, content} = jsonRow(indent);
       appendKey(content, key);
-      const tog = span("json-toggle", "▼");
+      const tog = span("json-toggle", "▶");
       content.appendChild(tog);
       content.appendChild(span("json-string", '"…"'));
       content.appendChild(span("json-meta", value.length + " chars"));
@@ -271,12 +314,14 @@ function renderJsonValue(value, container, indent, key) {
       const {row: row2, content: c2} = jsonRow(indent + 1);
       const sw = el("span", "json-string");
       const inner = el("span", "json-string-content");
-      setText(inner, '"' + value + '"');
+      let loaded = false;
+      row2.style.display = "none";
       sw.appendChild(inner);
       c2.appendChild(sw);
       container.appendChild(row2);
       tog.addEventListener("click", (e) => {
         e.stopPropagation();
+        if (!loaded) { setText(inner, '"' + value + '"'); loaded = true; }
         row2.style.display = row2.style.display === "none" ? "" : "none";
         tog.textContent = row2.style.display === "none" ? "▶" : "▼";
       });
@@ -303,13 +348,17 @@ function renderJsonValue(value, container, indent, key) {
     content.appendChild(span("json-meta", "Array(" + value.length + ")"));
     container.appendChild(row);
     const childWrap = el("div", "json-children");
-    value.forEach((v, i) => renderJsonValue(v, childWrap, indent + 1, String(i)));
+    let mounted = false;
+    const mount = () => { if (!mounted) { mounted = true; value.forEach((v, i) => renderJsonValue(v, childWrap, indent + 1, String(i))); } };
+    if (indent === 0) mount();
+    else { childWrap.classList.add("collapsed"); tog.textContent = "▶"; }
     container.appendChild(childWrap);
     const {row: r2, content: c2} = jsonRow(indent);
     c2.appendChild(span("json-bracket", "]"));
     container.appendChild(r2);
     tog.addEventListener("click", (e) => {
       e.stopPropagation();
+      mount();
       childWrap.classList.toggle("collapsed");
       tog.textContent = childWrap.classList.contains("collapsed") ? "▶" : "▼";
     });
@@ -331,13 +380,17 @@ function renderJsonValue(value, container, indent, key) {
     content.appendChild(span("json-meta", "{" + keys.length + " keys}"));
     container.appendChild(row);
     const childWrap = el("div", "json-children");
-    keys.forEach(k => renderJsonValue(value[k], childWrap, indent + 1, k));
+    let mounted = false;
+    const mount = () => { if (!mounted) { mounted = true; keys.forEach(k => renderJsonValue(value[k], childWrap, indent + 1, k)); } };
+    if (indent === 0) mount();
+    else { childWrap.classList.add("collapsed"); tog.textContent = "▶"; }
     container.appendChild(childWrap);
     const {row: r2, content: c2} = jsonRow(indent);
     c2.appendChild(span("json-bracket", "}"));
     container.appendChild(r2);
     tog.addEventListener("click", (e) => {
       e.stopPropagation();
+      mount();
       childWrap.classList.toggle("collapsed");
       tog.textContent = childWrap.classList.contains("collapsed") ? "▶" : "▼";
     });
@@ -468,7 +521,14 @@ function renderDetail(node) {
     if (kind === true || kind === "error") cls += " error";
     else if (kind === "warn") cls += " warn";
     const e = el("div", cls);
-    setText(e, s || ""); return e;
+    const text = String(s || "");
+    setText(e, text.slice(0, 12000));
+    if (text.length > 12000) {
+      const more = el("button", "tag", "展开完整文本（" + fmtInt(text.length) + " chars）");
+      more.addEventListener("click", () => { setText(e, text); });
+      e.appendChild(more);
+    }
+    return e;
   }
 
   if (t === "session") {
@@ -601,7 +661,22 @@ function renderDetail(node) {
     if (d.input) {
       // input 是发给 LLM 的完整 payload (model + messages + tools)
       const inputCount = d.input.messages ? `${d.input.messages.length} msgs` : "";
-      section("input", "Input" + (inputCount ? ` (${inputCount})` : ""), renderJsonRoot(d.input));
+      if (d.input.__lazy && window.__piTraceNodeUrl) {
+        const wrap = el("div");
+        const button = el("button", "tag", "加载此步 Input（按需读取）");
+        wrap.appendChild(button);
+        button.addEventListener("click", async () => {
+          button.disabled = true;
+          setText(button, "加载 Input…");
+          try {
+            const res = await fetch(window.__piTraceNodeUrl + encodeURIComponent(node.id) + "&field=input");
+            if (!res.ok) throw new Error("HTTP " + res.status);
+            const payload = await res.json();
+            wrap.replaceChildren(renderJsonRoot(payload.input));
+          } catch (error) { button.disabled = false; setText(button, "重试加载 Input"); }
+        });
+        section("input", "Input", wrap);
+      } else section("input", "Input" + (inputCount ? ` (${inputCount})` : ""), renderJsonRoot(d.input));
     }
     if (d.thinking) {
       const e = el("div", "thinking-block"); setText(e, d.thinking);
@@ -980,6 +1055,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   document.getElementById("tree-search").addEventListener("input", (e) => applySearch(e.target.value));
   document.getElementById("expand-all").addEventListener("click", () => {
+    mountAllRows();
     document.querySelectorAll(".node-children").forEach(c => c.classList.remove("hidden"));
     document.querySelectorAll(".node-row").forEach(r => r.classList.remove("collapsed"));
   });
@@ -998,6 +1074,7 @@ window.addEventListener("DOMContentLoaded", () => {
       onlyErrBtn.classList.toggle("active", filterState.onlyErrors);
       // 打开时强制全展开，避免折叠住的错误节点被 display:none 掩盖
       if (filterState.onlyErrors) {
+        mountAllRows();
         document.querySelectorAll(".node-children").forEach(c => c.classList.remove("hidden"));
         document.querySelectorAll(".node-row").forEach(r => r.classList.remove("collapsed"));
       }

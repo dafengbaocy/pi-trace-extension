@@ -22,7 +22,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -304,7 +304,7 @@ export default function (pi: ExtensionAPI) {
 		return s.length > TRUNCATE_STR ? s.slice(0, TRUNCATE_STR) + `…[truncated ${s.length - TRUNCATE_STR}]` : s;
 	};
 
-	// 简化 LLM provider payload：保留语义字段，截断长内容
+	// Record the latest message, not the ever-growing full transcript on every request.
 	const summarizePayload = (payload: any): any => {
 		if (!payload || typeof payload !== "object") return payload;
 		const out: any = {};
@@ -312,14 +312,15 @@ export default function (pi: ExtensionAPI) {
 		for (const k of Object.keys(payload)) {
 			const v = payload[k];
 			if (k === "messages" && Array.isArray(v)) {
-				out.messages = v.map(summarizeMessage);
+				out.messageCount = v.length;
+				out.messages = v.slice(-1).map(summarizeMessage);
+				out.traceCapture = "latest-message; full transcript remains in the Pi session file";
 			} else if (k === "tools" && Array.isArray(v)) {
 				// 只保留工具名 + 描述，不保留完整 schema（schema 一般固定，体积大）
 				out.tools = v.map((t: any) => ({
 					name: t?.function?.name ?? t?.name,
 					description: truncStr(t?.function?.description ?? t?.description),
-					// 参数 schema 太大，单独截断 JSON
-					parameters: t?.function?.parameters ?? t?.parameters,
+					// Fixed schemas are not duplicated in every request event.
 				}));
 			} else if (k === "system" || k === "system_prompt") {
 				out[k] = truncStr(v);
@@ -538,21 +539,36 @@ export default function (pi: ExtensionAPI) {
 	// HTML 渲染：spawn python3 trace_to_html.py，把 events.jsonl 转成可视化 HTML
 	// ========================================================================
 
-	const renderHtml = (opts: { open: boolean; sync?: boolean }): { ok: boolean; output?: string; error?: string } => {
-		if (!sessionDir) return { ok: false, error: "no active session" };
+	const waitForRender = (args: string[]): Promise<void> => new Promise((resolve, reject) => {
+		const child = spawn(PYTHON_BIN, args, { stdio: ["ignore", "ignore", "pipe"] });
+		const timeout = setTimeout(() => { child.kill(); }, 30000);
+		timeout.unref();
+		let stderr = "";
+		child.stderr?.on("data", (data) => { stderr += data.toString(); });
+		child.once("error", (error) => { clearTimeout(timeout); reject(error); });
+		child.once("close", (code, signal) => {
+			clearTimeout(timeout);
+			if (code === 0) resolve();
+			else reject(new Error(stderr || `exit ${code} (${signal || "no signal"})`));
+		});
+	});
+
+	const renderHtml = async (opts: { open: boolean; wait?: boolean; dir?: string }): Promise<{ ok: boolean; output?: string; error?: string }> => {
+		const dir = opts.dir ?? sessionDir;
+		if (!dir) return { ok: false, error: "no active session" };
 		if (!fs.existsSync(PYTHON_SCRIPT)) {
 			return { ok: false, error: `trace_to_html.py not found at ${PYTHON_SCRIPT}` };
 		}
-		const args = [PYTHON_SCRIPT, sessionDir];
+		const args = [PYTHON_SCRIPT, dir];
 		try {
-			if (opts.sync) {
-				const r = spawnSync(PYTHON_BIN, args, { encoding: "utf-8", timeout: 30000 });
-				if (r.status !== 0) return { ok: false, error: r.stderr || r.stdout || `exit ${r.status}` };
+			if (opts.wait) {
+				await waitForRender(args);
 			} else {
 				const child = spawn(PYTHON_BIN, args, { stdio: "ignore", detached: true });
+				child.once("error", () => { /* optional background render */ });
 				child.unref();
 			}
-			const output = path.join(sessionDir, "trace.html");
+			const output = path.join(dir, "trace.html");
 			if (opts.open) openInBrowser(output);
 			return { ok: true, output };
 		} catch (err: any) {
@@ -562,17 +578,17 @@ export default function (pi: ExtensionAPI) {
 
 	// 跨会话 dashboard：spawn python3 trace_to_html.py --dashboard
 	// 与 renderHtml 对称，扫描 ~/.pi/agent/traces/ 下所有 session 生成 index.html
-	const renderDashboard = (opts: { open: boolean; sync?: boolean }): { ok: boolean; output?: string; error?: string } => {
+	const renderDashboard = async (opts: { open: boolean; wait?: boolean }): Promise<{ ok: boolean; output?: string; error?: string }> => {
 		if (!fs.existsSync(PYTHON_SCRIPT)) {
 			return { ok: false, error: `trace_to_html.py not found at ${PYTHON_SCRIPT}` };
 		}
 		const args = [PYTHON_SCRIPT, "--dashboard"];
 		try {
-			if (opts.sync) {
-				const r = spawnSync(PYTHON_BIN, args, { encoding: "utf-8", timeout: 30000 });
-				if (r.status !== 0) return { ok: false, error: r.stderr || r.stdout || `exit ${r.status}` };
+			if (opts.wait) {
+				await waitForRender(args);
 			} else {
 				const child = spawn(PYTHON_BIN, args, { stdio: "ignore", detached: true });
+				child.once("error", () => { /* optional background render */ });
 				child.unref();
 			}
 			const output = path.join(TRACE_DIR, "index.html");
@@ -589,7 +605,9 @@ export default function (pi: ExtensionAPI) {
 			: platform === "win32" ? "start"
 			: "xdg-open";
 		try {
-			spawn(cmd, [filePath], { stdio: "ignore", detached: true, shell: platform === "win32" }).unref();
+			const child = spawn(cmd, [filePath], { stdio: "ignore", detached: true, shell: platform === "win32" });
+			child.once("error", () => { /* user can open the output manually */ });
+			child.unref();
 		} catch {
 			// 静默失败：用户可手动打开
 		}
@@ -603,11 +621,11 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const sub = (args || "").trim().toLowerCase();
 			if (sub === "") {
-				const r = renderHtml({ open: true, sync: true });
+				const r = await renderHtml({ open: true, wait: true });
 				if (r.ok) ctx.ui.notify(`✓ trace.html → ${r.output}`, "info");
 				else ctx.ui.notify(`✗ trace render failed: ${r.error}`, "error");
 			} else if (sub === "all") {
-				const r = renderDashboard({ open: true, sync: true });
+				const r = await renderDashboard({ open: true, wait: true });
 				if (r.ok) ctx.ui.notify(`✓ dashboard → ${r.output}`, "info");
 				else ctx.ui.notify(`✗ dashboard render failed: ${r.error}`, "error");
 			} else if (sub === "serve") {
@@ -628,14 +646,13 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", safeHandler("session_shutdown", () => {
 		void stopServe().catch(() => { /* fail-open */ });
 		writeEvent(baseEvent({ type: "session_shutdown" }));
-		// H1 修复：立即置 null 屏蔽后续写入，避免 renderHtml(sync) 阻塞期间被
-		// 其他 handler（如未收尾的 tool_end）写到已 end() 的 stream 上触发
-		// ERR_STREAM_WRITE_AFTER_END → uncaughtException 崩 pi
+		// Stop late events from writing to the closing stream.
 		const stream = writeStream;
 		writeStream = null;
-		try { stream?.end(); } catch { /* ignore */ }
-		// 兜底：session 退出时同步生成一次 HTML（不打开浏览器）
-		try { renderHtml({ open: false, sync: true }); } catch { /* silent */ }
+		// Live viewing is served on 4317; static HTML is generated only by /trace.
+		try {
+			stream?.end();
+		} catch { /* ignore */ }
 	}));
 
 	// 把上游 event 对象展开但保护 baseEvent 设的关键字段（type/ts/sessionId/turnIndex/stepIndex）
@@ -760,7 +777,7 @@ export default function (pi: ExtensionAPI) {
 			})),
 			userPrompt: userPromptThisTurn,
 			finalText: finalAssistantText,
-			steps: stepsThisTurn,
+			steps: stepsThisTurn.map(({ stepIndex, durationMs }) => ({ stepIndex, durationMs })),
 			toolResultCount: event.toolResults?.length ?? 0,
 		};
 
@@ -800,8 +817,7 @@ export default function (pi: ExtensionAPI) {
 			type: "step_start",
 		}));
 
-		// 采集发给 LLM 的完整 payload（model + 全量 messages + tools schema）
-		// 用于 Langfuse 风格的 Input 视图
+		// Capture a bounded per-request preview; the session file keeps the transcript.
 		const payload = (event as any)?.payload;
 		const inputPayload = payload ? summarizePayload(payload) : undefined;
 
@@ -857,7 +873,8 @@ export default function (pi: ExtensionAPI) {
 
 		// event.message / event.partial are cumulative snapshots. They cover providers that
 		// put thinking text on the partial block without a separate delta payload.
-		for (const candidate of [(event as any).message, assistantEvent.partial]) {
+		const hasDelta = eventType === "thinking_delta" && typeof assistantEvent.delta === "string" && assistantEvent.delta.length > 0;
+		for (const candidate of hasDelta ? [] : [(event as any).message, assistantEvent.partial]) {
 			const parts = extractParts(candidate);
 			rememberStreamThinking(parts.thinking);
 			if (parts.thinkingRedacted) streamThinkingRedacted = true;
