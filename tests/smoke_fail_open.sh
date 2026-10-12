@@ -55,7 +55,9 @@ fi
 echo
 
 echo "== Test 2: traces 目录只读 (触发 C2 mkdir 失败路径) =="
-orig_mode=$(stat -f '%p' "$TRACES" 2>/dev/null | tail -c 4)
+# 注意：GNU stat 的 -f 是 "file system" 模式，BSD/macOS 的 -f 才是 "格式"。
+# 必须分支，否则 Linux 上会拿到垃圾值并用 chmod 破坏目录权限。
+orig_mode=$(stat -c '%a' "$TRACES" 2>/dev/null || stat -f '%p' "$TRACES" | tail -c 4)
 chmod 555 "$TRACES"
 rc=$(run_pi)
 chmod "$orig_mode" "$TRACES"
